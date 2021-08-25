@@ -1,0 +1,819 @@
+version: "3.9"
+
+networks:
+  default:
+    ipam:
+      driver: default
+      config:
+        - subnet: ${DOCKER_SUBNET}
+
+x-logging:
+      &default-logging
+      driver: "json-file"
+      options:
+        max-size: "10M"
+        max-file: "10"
+
+services:
+
+################################################################################
+### Core services for FASTEN
+################################################################################
+
+  zookeeper:
+    image: ${ZOOKEEPER_IMAGE}
+    container_name: zookeeper
+    restart: "unless-stopped"
+    env_file:
+      - zoo.env
+    volumes:
+      - ${FASTEN_VOLUME_MOUNT}/zookeeper/data:/data
+      - ${FASTEN_VOLUME_MOUNT}/zookeeper/datalog:/datalog
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  kafka:
+    image: ${KAFKA_IMAGE}
+    container_name: kafka
+    restart: "unless-stopped"
+    env_file:
+      kafka.env
+    volumes:
+      - ${FASTEN_VOLUME_MOUNT}/kafka:/kafka
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - zookeeper
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop
+    container_name: kafkadrop
+    restart: "unless-stopped"
+    ports:
+      - "${KAFDROP_HTTP_PORT}:9000"
+    environment:
+      KAFKA_BROKERCONNECT: "${KAFKA_INTERNAL_ADDR}"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+
+  metadata-db:
+    container_name: metadata-db
+    build:
+      context: metadata-db
+      dockerfile: Dockerfile
+    restart: "unless-stopped"
+    environment:
+      POSTGRES_PASSWORD: "${FASTEN_METADATA_DB_PASSWORD}"
+    ports:
+      - ${FASTEN_METADATA_DB_PORT}:5432
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    volumes:
+      - ${FASTEN_VOLUME_MOUNT}/metadata-db/data:/var/lib/postgresql/data
+
+  fasten-rapid-metadata-plugin:
+    profiles: ["java", "c", "python", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    container_name: rapid-metadata-plugin
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "QualityAnalyzer",
+      "-cg", "QualityAnalyzer",
+      "-kt", "QualityAnalyzer=fasten.RapidPlugin.callable.out",
+      "-d",  "mvn=${FASTEN_METADATA_DB_JAVA_URL},debian=${FASTEN_METADATA_DB_C_URL},PyPI=${FASTEN_METADATA_DB_PYTHON_URL}"
+    ]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+      - metadata-db
+
+  fasten-restapi-reverse-proxy:
+    profiles: ["java", "all"]
+    container_name: restapi-reverse-proxy
+    build:
+      context: restapi-reverse-proxy
+      dockerfile: Dockerfile
+    restart: "unless-stopped"
+    ports:
+      - "${FASTEN_API_HTTP_PORT}:80"
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - metadata-db
+
+################################################################################
+### FASTEN vulnerability services
+################################################################################
+
+  fasten-vulnerability-producer:
+    profiles: ["security", "all"]
+    image: ${FASTEN_VULNERABILITY_PRODUCER_IMAGE}
+    restart: "unless-stopped"
+    env_file:
+      - fasten-vulnerability-producer.env
+    environment:
+      FASTEN_MONGOPASS: "not-used"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-kt", "fasten.vulnerability.out",
+      "-po", "/mnt/fasten"
+    ]
+    volumes:
+      - ${FASTEN_VOLUME_MOUNT}:/mnt/fasten
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    depends_on:
+      - kafka
+
+  fasten-vulnerability-consumer:
+    profiles: ["security", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      FASTEN_API_URL: "${FASTEN_API_URL}"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k",  "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "VulnerabilityConsumerExtension",
+      "-kt", "VulnerabilityConsumerExtension=fasten.vulnerability.out",
+      "-po", "VulnerabilityConsumerExtension=/mnt/fasten",
+      "-d",  "mvn=${FASTEN_METADATA_DB_JAVA_URL},debian=${FASTEN_METADATA_DB_C_URL},PyPI=${FASTEN_METADATA_DB_PYTHON_URL}"
+    ]
+    volumes:
+      - ${FASTEN_VOLUME_MOUNT}:/mnt/fasten
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+      - metadata-db
+
+
+################################################################################
+### FASTEN license detection services
+################################################################################
+
+  fasten-license-detector:
+    profiles: ["license-detection", "all"]
+    container_name: license-detector
+    restart: "unless-stopped"
+    image: ${FASTEN_LICENSE_DETECTOR_IMAGE}
+    environment:
+      POD_INSTANCE_ID: "fasten-license-detector"
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "LicenseDetector",
+      "-kt", "LicenseDetector=fasten.SyncJava.out",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    depends_on:
+      - kafka
+
+  fasten-license-feeder:
+    profiles: ["license-detection", "all"]
+    container_name: license-feeder
+    restart: "unless-stopped"
+    image: ${FASTEN_LICENSE_FEEDER_IMAGE}
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      POD_INSTANCE_ID: "fasten-license-feeder"
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "LicenseFeeder",
+      "-kt", "LicenseFeeder=fasten.LicenseDetector.out",
+      "-d",  "mvn=${FASTEN_METADATA_DB_JAVA_URL}",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    depends_on:
+      - kafka
+      - metadata-db
+
+
+################################################################################
+### FASTEN server maintenance service
+################################################################################
+
+  fasten-server-maintenance:
+    profiles: ["maintenance"]
+    image: ${FASTEN_SERVER_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      JVM_MEM_MAX: ""
+    entrypoint: ["tail", "-f", "/dev/null"]
+    network_mode: "host"
+    volumes:
+      - ${FASTEN_VOLUME_MOUNT}:/mnt/fasten
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - metadata-db
+
+################################################################################
+### Java/Maven specific services for FASTEN
+################################################################################
+
+  fasten-repo-cloner:
+    profiles: ["license-detection", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    container_name: fasten-repo-cloner
+    restart: "unless-stopped"
+    environment:
+      FASTEN_MVN_REPO: "${FASTEN_MVN_REPO}"
+      POD_INSTANCE_ID: fasten-repo-cloner
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "RepoCloner",
+      "-kt", "RepoCloner=fasten.POMAnalyzer.out",
+      "-b",  "/mnt/fasten",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+
+  fasten-pom-analyzer:
+    profiles: ["license-detection", "java", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    container_name: pom-analyzer
+    restart: "unless-stopped"
+    environment:
+      FASTEN_MVN_REPO: "${FASTEN_MVN_REPO}"
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      POD_INSTANCE_ID: fasten-pom-analyzer
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "POMAnalyzer",
+      "-kt", "POMAnalyzer=fasten.mvn.releases",
+      "-d",  "mvn=${FASTEN_METADATA_DB_JAVA_URL}",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+      - metadata-db
+
+  fasten-opal:
+    profiles: ["license-detection", "java", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    container_name: fasten-opal
+    restart: "unless-stopped"
+    environment:
+      FASTEN_MVN_REPO: "${FASTEN_MVN_REPO}"
+      POD_INSTANCE_ID: "fasten-opal"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "OPAL",
+      "-kt", "OPAL=fasten.POMAnalyzer.out",
+      "-po", "OPAL=/mnt/fasten",
+      "--consume_timeout", "1200",
+      "--consume_timeout_exit",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    depends_on:
+      - kafka
+
+  fasten-metadata-db-extension-java:
+    profiles: ["license-detection", "java", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    container_name: metadata-db-extension-java
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      POD_INSTANCE_ID: "fasten-metadata-db-extension-java"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "MetadataDBJavaExtension",
+      "-kt", "MetadataDBJavaExtension=fasten.OPAL.out",
+      "-d",  "mvn=${FASTEN_METADATA_DB_JAVA_URL}",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    depends_on:
+      - kafka
+      - metadata-db
+
+  fasten-graph-db-extension-java:
+    profiles: ["java", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    container_name: graph-db-extension-java
+    restart: "unless-stopped"
+    environment:
+      POD_INSTANCE_ID: "fasten-graph-db-extension-java"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "GraphDBExtension",
+      "-kt", "GraphDBExtension=fasten.MetadataDBJavaExtension.out",
+      "-gd", "/mnt/fasten/graphdb",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - kafka
+
+  fasten-restapi-java:
+    profiles: ["java", "all"]
+    image: ${FASTEN_RESTAPI_IMAGE}
+    container_name: restapi-java
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+    command: [
+      "--ka=${KAFKA_INTERNAL_ADDR}",
+      "--kt=fasten.mvn.releases",
+      "--rcg.url=http://fasten-rcg-nginx-java:80",
+      "--gd.path=/mnt/fasten/graphdb",
+      "--dg.path=/mnt/fasten/dep_graph",
+      "--db.url=jdbc:postgresql://metadata-db:5432/fasten_java",
+      "--db.user=${FASTEN_METADATA_DB_USER}"
+    ]
+    ports:
+      - "${FASTEN_API_JAVA_HTTP_PORT}:8080"
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - metadata-db
+      - fasten-graph-db-extension-java
+
+  fasten-rcg-nginx-java:
+    profiles: ["java", "all"]
+    image: ${NGINX_IMAGE}
+    container_name: rcg-nginx-java
+    restart: "unless-stopped"
+    volumes:
+      - ${FASTEN_JAVA_RCG_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - fasten-restapi-java
+
+  fasten-flink-javasync-jobmanager:
+    profiles: ["license-detection", "all"]
+    container_name: flink-javasync-jobmanager
+    image: ${FASTEN_JAVASYNC_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FLINK_PROPERTIES: "jobmanager.rpc.address: fasten-flink-javasync-jobmanager"
+    command: [
+      "standalone-job",
+      "--job-classname", "eu.fasten.synchronization.Main",
+      "--brokers", "${KAFKA_INTERNAL_ADDR}",
+      "--topic_one", "fasten.RepoCloner.out",
+      "--topic_two", "fasten.MetadataDBJavaExtension.out",
+      "--output_topic", "SyncJava",
+      "--topic_one_keys", "input.input.groupId,input.input.artifactId,input.input.version",
+      "--topic_two_keys", "input.input.input.groupId,input.input.input.artifactId,input.input.input.version",
+      "--window_time", "259200",
+      "--parallelism", "8",
+      "--backendFolder", "/mnt/fasten/flink-javasync",
+      "--delay_topic", "SyncJavaDelay",
+      "--enable_delay", "true"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    depends_on:
+      - kafka
+
+  fasten-flink-javasync-taskmanager:
+    profiles: ["license-detection", "all"]
+    image: ${FASTEN_JAVASYNC_IMAGE}
+    container_name: flink-javasync-taskmanager
+    restart: "unless-stopped"
+    environment:
+      FLINK_PROPERTIES: "jobmanager.rpc.address: fasten-flink-javasync-jobmanager"
+    command: [
+      "taskmanager"
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    depends_on:
+      - fasten-flink-javasync-jobmanager
+
+  fasten-rapid-plugin-java:
+    profiles: ["java", "all"]
+    image: ${FASTEN_RAPIDPLUGIN_IMAGE}
+    container_name: fasten-rapid-plugin-java
+    restart: "unless-stopped"
+    command: [
+      '--group_id=RapidPlugin_Maven',
+      '--sources_dir=/mnt/fasten/rapid',
+      '--consumer_timeout_ms=1000',
+      '--consume_topic=fasten.MetadataDBJavaExtension.out',
+      '--produce_topic=fasten.RapidPlugin.out',
+      '--produce_callable_topic=fasten.RapidPlugin.callable.out',
+      '--err_topic=fasten.RapidPlugin.err',
+      '--log_topic=fasten.RapidPlugin.log',
+      '--bootstrap_servers=${KAFKA_INTERNAL_ADDR}'
+    ]
+    volumes:
+      - ${FASTEN_JAVA_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+      - fasten-rapid-metadata-plugin
+
+################################################################################
+### C/Debian specific services for FASTEN
+################################################################################
+
+  fasten-cscout:
+    profiles: ["c", "all"]
+    image: ${FASTEN_CSCOUT_IMAGE}
+    restart: "unless-stopped"
+    privileged: true
+    command: [
+      "-i", "fasten.debian.releases",
+      "-o", "fasten.cscout.out",
+      "-e", "fasten.cscout.err",
+      "-l", "fasten.cscout.log",
+      "-b", "${KAFKA_INTERNAL_ADDR}",
+      "-g", "debian_group_cscout",
+      "-s", "5",
+      "-d", "/mnt/fasten"
+    ]
+    volumes:
+      - ${FASTEN_C_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - kafka
+
+  fasten-metadata-db-extension-c:
+    profiles: ["c", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      POD_INSTANCE_ID: "fasten-metadata-db-extension-c"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "MetadataDBCExtension",
+      "-kt", "MetadataDBCExtension=fasten.cscout.out",
+      "-d",  "debian=${FASTEN_METADATA_DB_C_URL}",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_C_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    depends_on:
+      - kafka
+      - metadata-db
+
+  fasten-graph-db-extension-c:
+    profiles: ["c", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      POD_INSTANCE_ID: "fasten-graph-db-extension-c"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "GraphDBExtension",
+      "-kt", "GraphDBExtension=fasten.MetadataDBCExtension.out",
+      "-gd", "/mnt/fasten/graphdb",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_C_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - kafka
+
+  fasten-restapi-c:
+    profiles: ["c", "all"]
+    image: ${FASTEN_RESTAPI_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+    command: [
+      "--ka=${KAFKA_INTERNAL_ADDR}",
+      "--kt=fasten.debian.releases.ingest",
+      "--rcg.url=http://fasten-rcg-nginx-c:80",
+      "--gd.path=/mnt/fasten/graphdb",
+      "--dg.path=/mnt/fasten/dep_graph",
+      "--db.url=jdbc:postgresql://metadata-db:5432/fasten_c",
+      "--db.user=${FASTEN_METADATA_DB_USER}"
+    ]
+    ports:
+      - "${FASTEN_API_C_HTTP_PORT}:8080"
+    volumes:
+      - ${FASTEN_C_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - metadata-db
+      - fasten-graph-db-extension-c
+
+  fasten-rcg-nginx-c:
+    profiles: ["c", "all"]
+    image: ${NGINX_IMAGE}
+    restart: "unless-stopped"
+    volumes:
+      - ${FASTEN_C_RCG_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - fasten-restapi-c
+
+  fasten-rapid-plugin-c:
+    profiles: ["c", "all"]
+    image: ${FASTEN_RAPIDPLUGIN_IMAGE}
+    restart: "unless-stopped"
+    command: [
+      '--group_id=RapidPlugin_Debian',
+      '--sources_dir=/mnt/fasten/rapid',
+      '--consumer_timeout_ms=1000',
+      '--consume_topic=fasten.MetadataDBCExtension.out',
+      '--produce_topic=fasten.RapidPlugin.out',
+      '--produce_callable_topic=fasten.RapidPlugin.callable.out',
+      '--err_topic=fasten.RapidPlugin.err',
+      '--log_topic=fasten.RapidPlugin.log',
+      '--bootstrap_servers=${KAFKA_INTERNAL_ADDR}'
+    ]
+    volumes:
+      - ${FASTEN_C_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+      - fasten-rapid-metadata-plugin
+
+################################################################################
+### Python/PyPI specific services for FASTEN
+################################################################################
+
+  fasten-pypi-filter:
+    profiles: ["python", "all"]
+    image: ${FASTEN_PYPI_FILTER_IMAGE}
+    privileged: true
+    restart: "unless-stopped"
+    command: [
+      "fasten.PyPI.releases",
+      "fasten.PyPIFilter.out",
+      "${KAFKA_INTERNAL_ADDR}",
+      "pypi_group_pypi_filter",
+      "5",
+      "--check-old"
+    ]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+
+  fasten-pycg:
+    profiles: ["python", "all"]
+    image: ${FASTEN_PYCG_IMAGE}
+    privileged: true
+    restart: "unless-stopped"
+    command: [
+      "fasten.PyPIFilter.out",
+      "fasten.PyCG.out",
+      "fasten.PyCG.err",
+      "${KAFKA_INTERNAL_ADDR}",
+      "pycg_group_pycg",
+      "5",
+      "/mnt/fasten",
+      "300000"
+    ]
+    volumes:
+      - ${FASTEN_PYTHON_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - kafka
+
+  fasten-metadata-db-extension-python:
+    profiles: ["python", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+      POD_INSTANCE_ID: "fasten-metadata-db-extension-python"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "MetadataDBPythonExtension",
+      "-kt", "MetadataDBPythonExtension=fasten.PyCG.out",
+      "-d",  "PyPI=${FASTEN_METADATA_DB_PYTHON_URL}",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_PYTHON_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    depends_on:
+      - kafka
+      - metadata-db
+
+  fasten-graph-db-extension-python:
+    profiles: ["python", "all"]
+    image: ${FASTEN_SERVER_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      POD_INSTANCE_ID: "fasten-graph-db-extension-python"
+      JVM_MEM_MAX: ""
+    command: [
+      "-k", "${KAFKA_INTERNAL_ADDR}",
+      "-pl", "GraphDBExtension",
+      "-kt", "GraphDBExtension=fasten.MetadataDBPythonExtension.out",
+      "-gd", "/mnt/fasten/graphdb",
+      "--local_storage"
+    ]
+    volumes:
+      - ${FASTEN_PYTHON_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    depends_on:
+      - kafka
+
+  fasten-restapi-python:
+    profiles: ["python", "all"]
+    image: ${FASTEN_RESTAPI_IMAGE}
+    restart: "unless-stopped"
+    environment:
+      FASTEN_DBPASS: "${FASTEN_METADATA_DB_PASSWORD}"
+    command: [
+      "--ka=${KAFKA_INTERNAL_ADDR}",
+      "--kt=fasten.PyPI.releases.ingest",
+      "--rcg.url=http://fasten-rcg-nginx-python:80",
+      "--gd.path=/mnt/fasten/graphdb",
+      "--dg.path=/mnt/fasten/dep_graph",
+      "--db.url=jdbc:postgresql://metadata-db:5432/fasten_python",
+      "--db.user=${FASTEN_METADATA_DB_USER}"
+    ]
+    ports:
+      - "${FASTEN_API_PYTHON_HTTP_PORT}:8080"
+    volumes:
+      - ${FASTEN_PYTHON_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - metadata-db
+      - fasten-graph-db-extension-python
+
+  fasten-rcg-nginx-python:
+    profiles: ["python", "all"]
+    image: ${NGINX_IMAGE}
+    restart: "unless-stopped"
+    volumes:
+      - ${FASTEN_PYTHON_RCG_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    depends_on:
+      - fasten-restapi-python
+
+  fasten-rapid-plugin-python:
+    profiles: ["python", "all"]
+    image: ${FASTEN_RAPIDPLUGIN_IMAGE}
+    restart: "unless-stopped"
+    command: [
+      '--group_id=RapidPlugin_PyPi',
+      '--sources_dir=/mnt/fasten/rapid',
+      '--consumer_timeout_ms=1000',
+      '--consume_topic=fasten.MetadataDBPythonExtension.out',
+      '--produce_topic=fasten.RapidPlugin.out',
+      '--produce_callable_topic=fasten.RapidPlugin.callable.out',
+      '--err_topic=fasten.RapidPlugin.err',
+      '--log_topic=fasten.RapidPlugin.log',
+      '--bootstrap_servers=${KAFKA_INTERNAL_ADDR}'
+    ]
+    volumes:
+      - ${FASTEN_PYTHON_VOLUME_MOUNT}
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    depends_on:
+      - kafka
+      - fasten-rapid-metadata-plugin
